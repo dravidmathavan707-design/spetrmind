@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Activity, BrainCircuit, CircleDot, RotateCcw, ScanLine } from 'lucide-react'
+import { Activity, BrainCircuit, Check, CircleDot, Pause, Play, RotateCcw, ScanLine, Square } from 'lucide-react'
 import './styles.css'
 
 const API = '/api'
@@ -21,6 +21,15 @@ function App() {
   const [selected, setSelected] = useState(0)
   const [focusedBand, setFocusedBand] = useState(null)
   const [inspectMode, setInspectMode] = useState('timeline')
+  const [liveEvent, setLiveEvent] = useState(null)
+  const [liveEvents, setLiveEvents] = useState([])
+  const [liveConnected, setLiveConnected] = useState(false)
+  const [runtimeStatus, setRuntimeStatus] = useState('connecting')
+  const [scenario, setScenario] = useState('stable')
+  const [connectionMessage, setConnectionMessage] = useState('connecting to scanner')
+  const socketRef = useRef(null)
+  const reconnectTimerRef = useRef(null)
+  const reconnectingRef = useRef(false)
 
   async function runMission() {
     setLoading(true)
@@ -49,6 +58,55 @@ function App() {
 
   useEffect(() => { runMission() }, [])
 
+  useEffect(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    let disposed = false
+
+    function connect() {
+      if (disposed || reconnectingRef.current) return
+      reconnectingRef.current = true
+      setConnectionMessage('connecting to scanner')
+      const socket = new WebSocket(`${protocol}://${window.location.host}/api/realtime`)
+      socketRef.current = socket
+
+      socket.onopen = () => {
+        reconnectingRef.current = false
+        setLiveConnected(true)
+        setConnectionMessage('scanner connected')
+      }
+      socket.onmessage = (event) => {
+        const nextEvent = JSON.parse(event.data)
+        setLiveEvent(nextEvent)
+        setRuntimeStatus(nextEvent.runtime_status || 'running')
+        setScenario(nextEvent.scenario || 'stable')
+        setLiveEvents((events) => [...events.slice(-199), nextEvent])
+      }
+      socket.onerror = () => {
+        setLiveConnected(false)
+        setConnectionMessage('backend unavailable, retrying')
+      }
+      socket.onclose = () => {
+        reconnectingRef.current = false
+        setLiveConnected(false)
+        if (!disposed) {
+          setConnectionMessage('backend unavailable, retrying')
+          reconnectTimerRef.current = window.setTimeout(connect, 1000)
+        }
+      }
+    }
+
+    connect()
+
+    return () => {
+      disposed = true
+      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current)
+      if (socketRef.current && socketRef.current.readyState < WebSocket.CLOSING) {
+        socketRef.current.close()
+      }
+      socketRef.current = null
+    }
+  }, [])
+
   const eventIndex = useMemo(() => {
     if (!mission) return -1
     if (inspectMode === 'timeline') return selected
@@ -58,17 +116,54 @@ function App() {
   const decision = eventIndex >= 0 ? mission?.decisions[eventIndex] : null
   const explanation = eventIndex >= 0 ? mission?.explanations[eventIndex] : null
   const observation = eventIndex >= 0 ? mission?.observations[eventIndex] : null
-  const metrics = mission?.metrics
+  const selectedBandEvents = focusedBand == null ? [] : [
+    ...(mission?.observations || []).filter((observation) => observation.band === focusedBand),
+    ...liveEvents.filter((event) => event.band === focusedBand),
+  ]
+  const selectedBandHits = selectedBandEvents.filter((event) => event.detected).length
+  const selectedBandRate = selectedBandEvents.length
+    ? selectedBandHits / selectedBandEvents.length
+    : null
+  const showingBandResult = inspectMode === 'band' && focusedBand != null && selectedBandRate != null
+  const metrics = showingBandResult
+    ? { ...((liveEvent?.metrics || mission?.metrics) || {}), detection_rate: selectedBandRate, hits: selectedBandHits, misses: selectedBandEvents.length - selectedBandHits }
+    : (liveEvent?.metrics || mission?.metrics)
   const activeBand = inspectMode === 'band' ? focusedBand : (decision?.band ?? focusedBand)
-  const spectrumState = activeBand != null
-    ? mission?.spectrum?.[activeBand] ?? mission?.spectrum?.[String(activeBand)]
+  const liveSpectrum = liveEvent?.spectrum || mission?.spectrum || {}
+  const displayBand = inspectMode === 'band' ? focusedBand : (liveEvent?.band ?? activeBand)
+  const processSteps = liveEvent?.process?.steps || [
+    { key: 'world', label: 'Advance RF world', status: 'waiting' },
+    { key: 'score', label: 'Score candidate bands', status: 'waiting' },
+    { key: 'tune', label: 'Tune receiver', status: 'waiting' },
+    { key: 'measure', label: 'Measure selected frequency', status: 'waiting' },
+    { key: 'model', label: 'Update learning model', status: 'waiting' },
+  ]
+  const spectrumBands = Object.entries(liveSpectrum)
+  const spectrumState = displayBand != null
+    ? liveSpectrum?.[displayBand] ?? liveSpectrum?.[String(displayBand)]
     : null
 
   function inspectBand(bandId) {
     setInspectMode('band')
     setFocusedBand(bandId)
-    const last = lastIndexForBand(mission.decisions, bandId)
+    const last = lastIndexForBand(mission?.decisions || [], bandId)
     if (last >= 0) setSelected(last)
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type: 'tune', band: bandId }))
+    }
+  }
+
+  function sendCommand(type, payload = {}) {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify({ type, ...payload }))
+    }
+  }
+
+  function changeScenario(event) {
+    const nextScenario = event.target.value
+    setScenario(nextScenario)
+    setLiveEvents([])
+    sendCommand('scenario', { scenario: nextScenario })
   }
 
   function inspectEvent(index) {
@@ -87,9 +182,22 @@ function App() {
             <small>cognitive spectrum / receiver control room</small>
           </div>
         </div>
-        <button type="button" className="run-button" onClick={runMission} disabled={loading}>
-          <RotateCcw size={16} /> {loading ? 'Running' : 'Run mission'}
-        </button>
+        <div className="control-bar">
+          <button type="button" className="control-button primary" onClick={() => sendCommand('start')} disabled={!liveConnected}><Play size={14} /> Start</button>
+          <button type="button" className="control-button" onClick={() => sendCommand('pause')} disabled={!liveConnected}><Pause size={14} /> Pause</button>
+          <button type="button" className="control-button" onClick={() => sendCommand('stop')} disabled={!liveConnected}><Square size={13} /> Stop</button>
+          <button type="button" className="control-button" onClick={() => sendCommand('reset', { scenario })} disabled={!liveConnected}><RotateCcw size={14} /> Reset</button>
+          <select className="scenario-select" value={scenario} onChange={changeScenario} disabled={!liveConnected} aria-label="Select RF scenario">
+            <option value="stable">Stable emitter</option>
+            <option value="bursty">Bursty signal</option>
+            <option value="periodic">Periodic signal</option>
+            <option value="frequency_agile">Frequency agile</option>
+            <option value="multiple_emitters">Multiple emitters</option>
+            <option value="weak">Weak emitter</option>
+            <option value="noisy">Noisy environment</option>
+            <option value="changing">Changing emitters</option>
+          </select>
+        </div>
       </header>
       <section className="hero">
         <div>
@@ -97,27 +205,55 @@ function App() {
           <h1>Find the signal<br /><em>before it moves.</em></h1>
           <p className="lede">An uncertainty-aware receiver learns the spectrum one scan at a time.</p>
         </div>
-        <div className="status"><span className="pulse" /> SYSTEM ONLINE <small>40-step evaluation</small></div>
+        <div className="status"><span className="pulse" /> {liveConnected ? runtimeStatus.toUpperCase() : 'CONNECTING'} <small>{liveEvent ? `${scenario} / B${liveEvent.band} / ${liveEvent.detected ? 'HIT' : 'MISS'}` : connectionMessage}</small></div>
+      </section>
+      <section className="live-strip">
+        <div className="live-label"><span className="live-dot" /> LIVE TELEMETRY <small>stateful scanner</small></div>
+        <div className="live-reading"><span>current target</span><strong>{liveEvent ? `B${liveEvent.band}` : '—'}</strong></div>
+        <div className="live-reading"><span>last result</span><strong className={liveEvent?.detected ? 'live-hit' : ''}>{liveEvent ? (liveEvent.detected ? 'HIT' : 'MISS') : '—'}</strong></div>
+        <div className="live-reading"><span>scan clock</span><strong>{liveEvent ? `${String(Math.trunc(liveEvent.time)).padStart(2, '0')}s` : '—'}</strong></div>
+        <div className="live-reading"><span>confidence</span><strong>{liveEvent ? `${(Number(liveEvent.activity_score) * 100).toFixed(0)}%` : '—'}</strong></div>
+      </section>
+      <section className="process-panel">
+        <div className="process-heading">
+          <div><span className="section-index">01</span><strong>SCAN CYCLE</strong><small>frequency acquisition pipeline</small></div>
+          <span className="cycle-count">{liveEvent ? `cycle ${String(liveEvent.cycle).padStart(2, '0')}` : 'standby'}</span>
+        </div>
+        <div className="process-rail">
+          {processSteps.map((step, index) => (
+            <div className={`process-step ${step.status}`} key={step.key}>
+              <span className="process-marker">{step.status === 'complete' || step.status === 'active' ? <Check size={13} /> : index + 1}</span>
+              <div><b>{step.label}</b><small>{step.status === 'active' ? 'processing now' : step.status}</small></div>
+            </div>
+          ))}
+        </div>
       </section>
       {error ? <div className="loading error">{error}</div> : !mission ? <div className="loading">Initializing mission telemetry...</div> : <>
         <section className="grid">
           <article className="panel spectrum-panel">
             <div className="panel-head"><span>01 / SPECTRUM STATE</span><Activity size={17} /></div>
-            <div className="bands">
-              {Object.entries(mission.spectrum).map(([band, state]) => {
+            <div className="spectrum-visual">
+              <div className="power-label">SIGNAL POWER / LEARNED ACTIVITY</div>
+              <div className="frequency-flow" aria-hidden="true" />
+              <div className="bands">
+              {spectrumBands.map(([band, state]) => {
                 const bandId = Number(band)
+                const power = Math.max(8, Math.min(100, (state.activity_probability || 0) * 100))
                 return (
                   <button
                     type="button"
-                    className={`band ${activeBand === bandId ? 'selected' : ''} ${state.activity_probability > 0.65 ? 'hot' : ''}`}
+                    className={`band ${displayBand === bandId ? 'selected' : ''} ${state.activity_probability > 0.65 ? 'hot' : ''}`}
                     key={band}
                     onClick={() => inspectBand(bandId)}
                   >
-                    <i style={{ height: `${Math.max(8, state.activity_probability * 100)}%` }} />
+                    <i style={{ height: `${power}%` }} />
+                    {displayBand === bandId && <span className="tuning-cursor"><span /> RECEIVER</span>}
                     <span>B{band}</span>
                   </button>
                 )
               })}
+              </div>
+              <div className="frequency-axis"><span>LOW FREQUENCY</span><span>SCANNED TARGET: {liveEvent ? `B${liveEvent.band}` : 'STANDBY'}</span><span>HIGH FREQUENCY</span></div>
             </div>
             <div className="legend">
               <span><i className="dot hot-dot" /> learned activity</span>
@@ -130,11 +266,11 @@ function App() {
               <>
                 <div className="target">
                   <small>SELECTED BAND</small>
-                  <strong>B{decision.band}</strong>
-                  <span>{Number(decision.dwell).toFixed(0)} ms dwell</span>
+                  <strong>B{displayBand ?? decision.band}</strong>
+                  <span>{inspectMode === 'band' ? 'selected band / inspection' : (liveEvent ? `${Number(liveEvent.dwell).toFixed(0)} ms dwell / live` : `${Number(decision.dwell).toFixed(0)} ms dwell`)}</span>
                 </div>
                 <div className="readings">
-                  {[['Prediction', decision.activity_score], ['Uncertainty', decision.uncertainty], ['Information', decision.information_gain], ['Drift', decision.drift ? 1 : 0]].map(([label, value]) => (
+                  {[['Prediction', liveEvent?.activity_score ?? decision.activity_score], ['Uncertainty', liveEvent?.uncertainty ?? decision.uncertainty], ['Information', liveEvent?.information_gain ?? decision.information_gain], ['Drift', liveEvent?.drift ? 1 : (decision.drift ? 1 : 0)]].map(([label, value]) => (
                     <div key={label}>
                       <span>{label}</span>
                       <b>{Number(value).toFixed(2)}</b>
@@ -166,10 +302,10 @@ function App() {
             )}
           </article>
           <article className="panel metrics-panel">
-            <div className="panel-head"><span>03 / MISSION RESULT</span><CircleDot size={17} /></div>
+            <div className="panel-head"><span>03 / {showingBandResult ? `BAND RESULT / B${focusedBand}` : (liveEvent ? 'LIVE RESULT' : 'MISSION RESULT')}</span><CircleDot size={17} /></div>
             <div className="metric-big">
               <strong>{((metrics?.detection_rate || 0) * 100).toFixed(1)}%</strong>
-              <span>scan detection rate</span>
+              <span>{showingBandResult ? `B${focusedBand} detection rate` : 'scan detection rate'}</span>
             </div>
             <div className="metric-row">
               <span>hits <b>{metrics?.hits}</b></span>
