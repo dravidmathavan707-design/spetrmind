@@ -87,3 +87,6 @@ cd SIH26055
 python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+
+http://127.0.0.1:8000/

@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from api.main import app, health
 from environment.scenarios import SCENARIOS
+from prediction.temporal_model import TemporalModel
 from realtime import RealtimeScanner
 
 
@@ -53,3 +54,17 @@ def test_websocket_stream_accepts_controls():
             websocket.send_json({"type": "stop"})
             stopped = websocket.receive_json()
             assert stopped["runtime_status"] == "stopped"
+
+
+def test_temporal_model_builds_feature_based_forecast():
+    model = TemporalModel(num_bands=4)
+
+    for step in range(12):
+        model.update({"time": step, "band": 1, "detected": step % 3 != 0, "signal_strength": 0.8 if step % 3 != 0 else 0.1})
+        model.update({"time": step, "band": 0, "detected": False, "signal_strength": 0.05})
+        model.update({"time": step, "band": 2, "detected": False, "signal_strength": 0.0})
+
+    model.train()
+
+    assert model.is_trained()
+    assert model.predict(1, future_time=15) > model.predict(0, future_time=15)
